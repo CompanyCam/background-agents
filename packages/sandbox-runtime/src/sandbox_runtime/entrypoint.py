@@ -896,6 +896,7 @@ class SandboxSupervisor:
         opencode_config: dict = {
             "model": f"{provider}/{model}",
             "permission": {"*": {"*": "allow"}},
+            "plugin": ["superpowers@git+https://github.com/obra/superpowers.git"],
         }
 
         # Inject MCP servers
