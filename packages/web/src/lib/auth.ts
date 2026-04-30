@@ -62,6 +62,17 @@ declare module "next-auth/jwt" {
   }
 }
 
+type GitHubEmail = { email: string; verified: boolean; primary: boolean };
+
+async function fetchGitHubEmails(accessToken: string): Promise<string[]> {
+  const response = await fetch("https://api.github.com/user/emails", {
+    headers: { Authorization: `Bearer ${accessToken}`, "User-Agent": "open-inspect" },
+  });
+  if (!response.ok) return [];
+  const emails = (await response.json()) as GitHubEmail[];
+  return emails.filter((e) => e.verified).map((e) => e.email);
+}
+
 export const BASE_GITHUB_OAUTH_SCOPE = "read:user user:email repo";
 
 export function buildGitHubOAuthScope(
@@ -107,10 +118,10 @@ function isVerifiedGoogleEmail(profile: Profile | undefined): boolean {
 export function getStaticSignInReason(args: {
   provider: string | undefined;
   profile: Profile | undefined;
-  email: string | null | undefined;
+  emails: string[] | undefined;
   config: AccessControlConfig;
 }): AccessAllowReason | null {
-  const { provider, profile, email, config } = args;
+  const { provider, profile, emails, config } = args;
 
   switch (provider) {
     case "google": {
@@ -118,7 +129,7 @@ export function getStaticSignInReason(args: {
       if (!isVerifiedGoogleEmail(profile)) {
         return null;
       }
-      return getAccessAllowReason(config, { email: email ?? undefined });
+      return getAccessAllowReason(config, { emails });
     }
     case "github":
     case undefined: {
@@ -129,7 +140,7 @@ export function getStaticSignInReason(args: {
       const githubProfile = profile as { login?: string } | undefined;
       return getAccessAllowReason(config, {
         githubUsername: githubProfile?.login,
-        email: email ?? undefined,
+        emails,
       });
     }
     default:
@@ -302,13 +313,21 @@ export const authOptions: NextAuthOptions = {
 
       const provider = account?.provider;
       const githubProfile = profile as { login?: string } | undefined;
+      const isGitHubProvider = provider === "github" || provider === undefined;
+
+      let emails: string[] | undefined = undefined;
+      if (isGitHubProvider && config.allowedDomains.length > 0 && account?.access_token) {
+        emails = await fetchGitHubEmails(account.access_token);
+      } else {
+        emails = user.email ? [user.email] : undefined;
+      }
 
       // Static, synchronous allowlist gate. Provider-aware: Google requires a
       // verified email before any email-based match (see getStaticSignInReason).
-      const staticReason = getStaticSignInReason({
+      const staticReason = await getStaticSignInReason({
         provider,
         profile,
-        email: user.email,
+        emails,
         config,
       });
       if (staticReason) {
@@ -323,7 +342,6 @@ export const authOptions: NextAuthOptions = {
       // Google or unrecognized — fails closed here without contacting GitHub, so
       // a non-GitHub OAuth token is never sent to GitHub's API.
       const allowedOrganizations = config.allowedOrganizations ?? [];
-      const isGitHubProvider = provider === "github" || provider === undefined;
       if (!isGitHubProvider || allowedOrganizations.length === 0) {
         logSignInDecision(githubProfile?.login, "deny", "no_matching_policy");
         return false;
