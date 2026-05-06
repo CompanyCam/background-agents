@@ -1,7 +1,7 @@
 locals {
-  name_suffix          = var.deployment_name
-  use_modal_backend    = var.sandbox_provider == "modal"
-  use_daytona_backend  = var.sandbox_provider == "daytona"
+  name_suffix         = var.deployment_name
+  use_modal_backend   = var.sandbox_provider == "modal"
+  use_daytona_backend = var.sandbox_provider == "daytona"
   # Modal omits the environment segment for the default "main" environment.
   # Non-main environments: "{workspace}-{env}--{app}.modal.run"
   # Default (main) environment:  "{workspace}--{app}.modal.run"
