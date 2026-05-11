@@ -1,3 +1,7 @@
+# The .secrets file is mentioned in GETTING_STARTED.md; this line ensures it
+# will be ignored.
+.secrets
+
 # Dependencies
 node_modules/
 .pnpm-store/
