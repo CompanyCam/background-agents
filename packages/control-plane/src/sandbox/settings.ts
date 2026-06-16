@@ -61,13 +61,19 @@ export function normalizeSandboxSettings(
     normalizeTunnelPorts(settings.tunnelPorts, reject, result);
   }
 
-  if (
-    typeof settings.setupTimeoutSeconds === "number" &&
-    Number.isInteger(settings.setupTimeoutSeconds) &&
-    settings.setupTimeoutSeconds >= MIN_SETUP_TIMEOUT_SECONDS &&
-    settings.setupTimeoutSeconds <= MAX_SETUP_TIMEOUT_SECONDS
-  ) {
-    result.setupTimeoutSeconds = settings.setupTimeoutSeconds;
+  if (settings.setupTimeoutSeconds !== undefined) {
+    if (
+      typeof settings.setupTimeoutSeconds !== "number" ||
+      !Number.isInteger(settings.setupTimeoutSeconds) ||
+      settings.setupTimeoutSeconds < MIN_SETUP_TIMEOUT_SECONDS ||
+      settings.setupTimeoutSeconds > MAX_SETUP_TIMEOUT_SECONDS
+    ) {
+      reject(
+        `setupTimeoutSeconds must be an integer between ${MIN_SETUP_TIMEOUT_SECONDS} and ${MAX_SETUP_TIMEOUT_SECONDS}`
+      );
+    } else {
+      result.setupTimeoutSeconds = settings.setupTimeoutSeconds;
+    }
   }
 
   let maxConcurrentChildSessions = normalizePositiveIntegerSetting(

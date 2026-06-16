@@ -210,7 +210,7 @@ describe("SandboxSettingsPage — tunnel ports editor", () => {
 
   it("renders child session limits from settings", () => {
     renderWithSWR(
-      globalSettings([], undefined, {
+      globalSettings([], undefined, undefined, {
         maxConcurrentChildSessions: 3,
         maxTotalChildSessions: 9,
       })
@@ -314,7 +314,7 @@ describe("SandboxSettingsPage — tunnel ports editor", () => {
         value={{
           provider: () => new Map(),
           fallback: {
-            [SETTINGS_KEY]: globalSettings([], undefined, {
+            [SETTINGS_KEY]: globalSettings([], undefined, undefined, {
               maxConcurrentChildSessions: 2,
               maxTotalChildSessions: 7,
             }),
@@ -499,6 +499,8 @@ describe("SandboxSettingsPage — setup timeout", () => {
                 tunnelPorts: [],
                 terminalEnabled: false,
                 setupTimeoutSeconds: 600,
+                maxConcurrentChildSessions: DEFAULT_MAX_CONCURRENT_CHILD_SESSIONS,
+                maxTotalChildSessions: DEFAULT_MAX_TOTAL_CHILD_SESSIONS,
               },
             },
           }),
