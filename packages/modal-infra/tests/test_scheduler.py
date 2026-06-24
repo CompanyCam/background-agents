@@ -21,7 +21,7 @@ class TestGitLsRemoteSha:
         with patch(
             "src.scheduler.image_builder.subprocess.run", return_value=mock_result
         ) as mock_run:
-            sha = _git_ls_remote_sha("acme", "repo", "main", "token123")
+            sha = _git_ls_remote_sha("acme", "repo", "refs/heads/main", "token123")
 
         assert sha == "abc123def456789"
         args = mock_run.call_args[0][0]
@@ -36,7 +36,7 @@ class TestGitLsRemoteSha:
         mock_result.stderr = "fatal: repository not found"
 
         with patch("src.scheduler.image_builder.subprocess.run", return_value=mock_result):
-            sha = _git_ls_remote_sha("acme", "repo", "main", "token")
+            sha = _git_ls_remote_sha("acme", "repo", "refs/heads/main", "token")
 
         assert sha is None
 
@@ -46,7 +46,7 @@ class TestGitLsRemoteSha:
         mock_result.stdout = ""
 
         with patch("src.scheduler.image_builder.subprocess.run", return_value=mock_result):
-            sha = _git_ls_remote_sha("acme", "repo", "main", "token")
+            sha = _git_ls_remote_sha("acme", "repo", "refs/heads/main", "token")
 
         assert sha is None
 
@@ -55,7 +55,7 @@ class TestGitLsRemoteSha:
             "src.scheduler.image_builder.subprocess.run",
             side_effect=Exception("timeout"),
         ):
-            sha = _git_ls_remote_sha("acme", "repo", "main", "token")
+            sha = _git_ls_remote_sha("acme", "repo", "refs/heads/main", "token")
 
         assert sha is None
 
@@ -67,10 +67,25 @@ class TestGitLsRemoteSha:
         with patch(
             "src.scheduler.image_builder.subprocess.run", return_value=mock_result
         ) as mock_run:
-            _git_ls_remote_sha("acme", "repo", "main", "")
+            _git_ls_remote_sha("acme", "repo", "refs/heads/main", "")
 
         args = mock_run.call_args[0][0]
         assert args[2] == "https://github.com/acme/repo.git"
+
+    def test_passes_head_ref_verbatim(self):
+        """The ref is forwarded to git ls-remote verbatim (e.g. "HEAD")."""
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "abc123\tHEAD\n"
+
+        with patch(
+            "src.scheduler.image_builder.subprocess.run", return_value=mock_result
+        ) as mock_run:
+            sha = _git_ls_remote_sha("acme", "repo", "HEAD", "token")
+
+        assert sha == "abc123"
+        args = mock_run.call_args[0][0]
+        assert args[3] == "HEAD"
 
 
 class TestShouldRebuild:
@@ -206,9 +221,7 @@ class TestRebuildRepoImages:
             "MODAL_API_SECRET": "test-secret",
         }
 
-        mock_enabled = {
-            "repos": [{"repoOwner": "acme", "repoName": "repo", "defaultBranch": "master"}]
-        }
+        mock_enabled = {"repos": [{"repoOwner": "acme", "repoName": "repo"}]}
         mock_status = {
             "images": [
                 {
@@ -270,8 +283,8 @@ class TestRebuildRepoImages:
         assert len(trigger_calls) == 1
         assert "acme/repo" in str(trigger_calls[0])
 
-        # Verify ls-remote was called with the real branch, not "main"
-        mock_ls_remote.assert_called_once_with("acme", "repo", "master", mock_ls_remote.call_args[0][3])
+        # Verify ls-remote followed HEAD (the default branch), not a hardcoded "main"
+        assert mock_ls_remote.call_args[0][:3] == ("acme", "repo", "HEAD")
 
     @pytest.mark.asyncio
     async def test_skips_build_when_sha_matches(self):
@@ -281,9 +294,7 @@ class TestRebuildRepoImages:
             "MODAL_API_SECRET": "test-secret",
         }
 
-        mock_enabled = {
-            "repos": [{"repoOwner": "acme", "repoName": "repo", "defaultBranch": "main"}]
-        }
+        mock_enabled = {"repos": [{"repoOwner": "acme", "repoName": "repo"}]}
         mock_status = {
             "images": [
                 {
@@ -345,9 +356,7 @@ class TestRebuildRepoImages:
         async def mock_get_side_effect(url, **kwargs):
             if "enabled-repos" in url:
                 return {
-                    "repos": [
-                        {"repoOwner": "acme", "repoName": "repo", "defaultBranch": "main"}
-                    ]
+                    "repos": [{"repoOwner": "acme", "repoName": "repo", "defaultBranch": "main"}]
                 }
             if "status" in url:
                 return {"images": []}
@@ -393,55 +402,3 @@ class TestRebuildRepoImages:
 
         cleanup_calls = [c for c in mock_post.call_args_list if "cleanup" in str(c)]
         assert len(cleanup_calls) == 1
-
-    @pytest.mark.asyncio
-    async def test_skips_repo_without_default_branch(self):
-        """Should skip repos that are missing defaultBranch in the enabled-repos response."""
-        env = {
-            "CONTROL_PLANE_URL": "https://cp.test",
-            "MODAL_API_SECRET": "test-secret",
-        }
-
-        # Repo returned without defaultBranch (e.g. control plane couldn't resolve it)
-        mock_enabled = {"repos": [{"repoOwner": "acme", "repoName": "repo"}]}
-
-        async def mock_get_side_effect(url, **kwargs):
-            if "enabled-repos" in url:
-                return mock_enabled
-            if "status" in url:
-                return {"images": []}
-            return {}
-
-        mock_ls_remote = MagicMock(return_value="abc123")
-
-        with (
-            patch.dict("os.environ", env, clear=False),
-            patch(
-                "src.scheduler.image_builder._api_get",
-                new_callable=AsyncMock,
-                side_effect=mock_get_side_effect,
-            ),
-            patch(
-                "src.scheduler.image_builder._api_post",
-                new_callable=AsyncMock,
-                return_value={"ok": True, "markedFailed": 0, "deleted": 0},
-            ) as mock_post,
-            patch(
-                "src.scheduler.image_builder._git_ls_remote_sha",
-                side_effect=mock_ls_remote,
-            ),
-            patch(
-                "sandbox_runtime.auth.github_app.generate_installation_token",
-                return_value="gh-token",
-            ),
-        ):
-            from src.scheduler.image_builder import rebuild_repo_images
-
-            await rebuild_repo_images.local()
-
-        # No trigger — repo was skipped
-        trigger_calls = [c for c in mock_post.call_args_list if "trigger" in str(c)]
-        assert len(trigger_calls) == 0
-
-        # ls-remote was never called — skipped before SHA check
-        mock_ls_remote.assert_not_called()

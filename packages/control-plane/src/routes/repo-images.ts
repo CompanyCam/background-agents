@@ -8,8 +8,9 @@
  * - Maintenance operations (stale builds, cleanup)
  */
 
-import { computeHmacHex } from "@open-inspect/shared";
+import { computeHmacHex, resolveBuildTimeoutSeconds } from "@open-inspect/shared";
 import { RepoImageStore } from "../db/repo-images";
+import { resolveSandboxSettings } from "../session/integration-settings-resolution";
 import { verifyInternalToken } from "../auth/internal";
 import { RepoMetadataStore } from "../db/repo-metadata";
 import { GlobalSecretsStore } from "../db/global-secrets";
@@ -31,7 +32,7 @@ import {
   parseJsonBody,
   extractRepoParams,
   createRouteSourceControlProvider,
-  resolveInstalledRepo,
+  resolveRepoOrError,
 } from "./shared";
 
 const logger = createLogger("router:repo-images");
@@ -613,12 +614,10 @@ async function handleTriggerBuild(
   const { owner, name } = params;
 
   // Resolve the repo to get its actual default branch — never assume "main".
-  const provider = createRouteSourceControlProvider(env);
-  const resolved = await resolveInstalledRepo(provider, owner, name);
-  if (!resolved) {
-    return error("Repository not found or not installed", 404);
-  }
-  const { defaultBranch } = resolved;
+  // The same resolution yields repoId, reused below for repo-scoped secrets.
+  const resolved = await resolveRepoOrError(env, owner, name, ctx, logger);
+  if (resolved instanceof Response) return resolved;
+  const { repoId, defaultBranch } = resolved;
 
   const store = new RepoImageStore(env.DB);
   const backend = getRepoImageBackend(env);
@@ -645,6 +644,9 @@ async function handleTriggerBuild(
     // Construct callback URL
     const callbackUrl = `${env.WORKER_URL}/repo-images/build-complete`;
 
+    const sandboxSettings = await resolveSandboxSettings(env.DB, owner, name);
+    const buildTimeoutSeconds = resolveBuildTimeoutSeconds(sandboxSettings);
+
     // Best-effort: fetch user secrets for the build sandbox
     let userEnvVars: Record<string, string> | undefined;
     if (env.REPO_SECRETS_ENCRYPTION_KEY) {
@@ -663,7 +665,7 @@ async function handleTriggerBuild(
       let repoSecrets: Record<string, string> = {};
       try {
         const repoStore = new RepoSecretsStore(env.DB, env.REPO_SECRETS_ENCRYPTION_KEY);
-        repoSecrets = await repoStore.getDecryptedSecrets(resolved.repoId);
+        repoSecrets = await repoStore.getDecryptedSecrets(repoId);
       } catch (e) {
         logger.warn("repo_image.repo_secrets_failed", {
           error: e instanceof Error ? e.message : String(e),
@@ -706,6 +708,7 @@ async function handleTriggerBuild(
             buildId,
             callbackUrl,
             userEnvVars,
+            buildTimeoutSeconds,
           },
           { trace_id: ctx.trace_id, request_id: ctx.request_id }
         );
@@ -737,6 +740,7 @@ async function handleTriggerBuild(
           callbackToken,
           userEnvVars,
           cloneToken,
+          buildTimeoutSeconds,
           onProviderSessionCreated: async (providerSessionId) => {
             const bound = await store.bindProviderSession(buildId, "vercel", providerSessionId);
             if (!bound) {
@@ -851,7 +855,9 @@ async function handleMarkStale(
     body = {};
   }
 
-  const maxAgeSeconds = body.max_age_seconds ?? 2100; // 35 minutes default
+  // Body-less fallback only; the scheduler always sends max_age_seconds explicitly.
+  // Mirrors STALE_BUILD_THRESHOLD_SECONDS in the Modal scheduler (image_builder.py).
+  const maxAgeSeconds = body.max_age_seconds ?? 4200;
   const maxAgeMs = maxAgeSeconds * 1000;
 
   const store = new RepoImageStore(env.DB);
@@ -1002,23 +1008,7 @@ async function handleGetEnabledRepos(
 
   try {
     const repos = await metadataStore.getImageBuildEnabledRepos();
-
-    // Resolve each repo's actual default branch so the scheduler can poll
-    // the right ref. Failures are silenced per-repo — a resolution error
-    // means the scheduler will skip that repo this tick, not crash.
-    const provider = createRouteSourceControlProvider(env);
-    const reposWithBranch = await Promise.all(
-      repos.map(async (repo) => {
-        try {
-          const resolved = await resolveInstalledRepo(provider, repo.repoOwner, repo.repoName);
-          return { ...repo, defaultBranch: resolved?.defaultBranch ?? "" };
-        } catch {
-          return { ...repo, defaultBranch: "" };
-        }
-      })
-    );
-
-    return json({ repos: reposWithBranch });
+    return json({ repos });
   } catch (e) {
     logger.error("repo_image.enabled_repos_error", {
       error: e instanceof Error ? e.message : String(e),
