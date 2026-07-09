@@ -24,10 +24,6 @@ export interface OpenComputerRestConfig {
   apiKey: string;
   /** Declarative template identifier containing the OpenInspect runtime */
   template: string;
-  /** Optional project/workspace/tenant scope */
-  projectId?: string;
-  /** Optional target/region/cell */
-  target?: string;
   /** Header used for API key authentication. Defaults to X-API-Key. */
   authHeaderName?: string;
   /** Optional prefix for the API key header value, e.g. "Bearer ". */
@@ -69,8 +65,6 @@ export interface OpenComputerCreateSandboxParams {
   labels?: Record<string, string>;
   timeoutSeconds?: number;
   secretStore?: string;
-  projectId?: string;
-  target?: string;
 }
 
 export interface OpenComputerForkCheckpointParams {
@@ -97,6 +91,10 @@ export type OpenComputerCheckpointRetentionPolicy = typeof OPENCOMPUTER_CHECKPOI
 export interface OpenComputerCreateCheckpointOptions {
   kind?: typeof OPENCOMPUTER_CHECKPOINT_KIND;
   retentionPolicy?: OpenComputerCheckpointRetentionPolicy;
+}
+
+export interface OpenComputerDeleteSandboxOptions {
+  deleteSecretStore?: boolean;
 }
 
 export interface OpenComputerExecResult {
@@ -226,16 +224,11 @@ export class OpenComputerRestClient {
     params: OpenComputerCreateSandboxParams
   ): Promise<OpenComputerSandboxResponse> {
     const startMs = Date.now();
-    const metadata = {
-      ...(params.labels ?? {}),
-      ...(params.projectId ? { opencomputer_project_id: params.projectId } : {}),
-      ...(params.target ? { opencomputer_target: params.target } : {}),
-    };
     const body: Record<string, unknown> = {
       templateID: "base",
       snapshot: params.template,
       envs: params.env,
-      metadata,
+      metadata: params.labels,
     };
     if (params.timeoutSeconds !== undefined) {
       body.timeout = params.timeoutSeconds;
@@ -352,8 +345,15 @@ export class OpenComputerRestClient {
     });
   }
 
-  async deleteSandbox(id: string): Promise<void> {
-    await this.request<void>("DELETE", this.expandPath(this.paths.sandbox, { id }), TIMEOUT_GET_MS);
+  async deleteSandbox(id: string, options?: OpenComputerDeleteSandboxOptions): Promise<void> {
+    const params = new URLSearchParams();
+    if (options?.deleteSecretStore) params.set("deleteSecretStore", "true");
+    const query = params.toString() ? `?${params.toString()}` : "";
+    await this.request<void>(
+      "DELETE",
+      `${this.expandPath(this.paths.sandbox, { id })}${query}`,
+      TIMEOUT_GET_MS
+    );
   }
 
   async startRuntime(id: string, extraEnv: Record<string, string> = {}): Promise<void> {
