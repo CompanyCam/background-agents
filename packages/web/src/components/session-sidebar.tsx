@@ -39,7 +39,7 @@ import {
   DataControlsIcon,
 } from "@/components/ui/icons";
 import { APP_SHORT_NAME } from "@/lib/site-config";
-import { formatRepoLabel } from "@/lib/repo-label";
+import { formatRepoLabel, formatSessionRepositoriesLabel } from "@/lib/repo-label";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -212,7 +212,7 @@ export function SessionSidebar({ onNewSession, onToggle, onSessionSelect }: Sess
 
   // Sort sessions by updatedAt (most recent first), filter by search query,
   // and group children under their parent sessions
-  const { activeSessions, inactiveSessions, childrenMap } = useMemo(() => {
+  const { activeSessions, inactiveSessions, childrenMap, hasFilteredSessions } = useMemo(() => {
     const filtered = sessions
       .filter((session) => session.status !== "archived")
       .filter((session) => {
@@ -263,7 +263,12 @@ export function SessionSidebar({ onNewSession, onToggle, onSessionSelect }: Sess
       }
     }
 
-    return { activeSessions: active, inactiveSessions: inactive, childrenMap: children };
+    return {
+      activeSessions: active,
+      inactiveSessions: inactive,
+      childrenMap: children,
+      hasFilteredSessions: filtered.length > 0,
+    };
   }, [sessions, searchQuery]);
 
   const currentSessionId = pathname?.startsWith("/session/") ? pathname.split("/")[2] : null;
@@ -441,6 +446,10 @@ export function SessionSidebar({ onNewSession, onToggle, onSessionSelect }: Sess
           </div>
         ) : sessions.length === 0 ? (
           <div className="px-4 py-8 text-center text-sm text-muted-foreground">{emptyMessage}</div>
+        ) : searchQuery && !hasFilteredSessions ? (
+          <div className="px-4 py-8 text-center text-sm text-muted-foreground">
+            No matching sessions
+          </div>
         ) : (
           <>
             {/* Active Sessions */}
@@ -645,7 +654,11 @@ function SessionListItem({
 }) {
   const timestamp = session.updatedAt || session.createdAt;
   const relativeTime = formatRelativeTime(timestamp);
-  const repoInfo = formatRepoLabel(session.repoOwner, session.repoName);
+  const repoInfo = formatSessionRepositoriesLabel(
+    session.repoOwner,
+    session.repoName,
+    session.repositories
+  );
   const displayTitle = session.title || repoInfo;
   // Orphan child (parent filtered out) — show a subtle badge
   const isOrphanChild = session.parentSessionId && session.spawnSource === "agent";
