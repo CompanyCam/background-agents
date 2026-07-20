@@ -1,4 +1,5 @@
 import type {
+  PullRequestDisplayStatus,
   SandboxEvent as SharedSandboxEvent,
   ScreenshotArtifactMetadata,
   VideoArtifactMetadata,
@@ -12,7 +13,7 @@ export interface Artifact {
   url: string | null;
   metadata?: (Partial<ScreenshotArtifactMetadata> | Partial<VideoArtifactMetadata>) & {
     prNumber?: number;
-    prState?: "open" | "merged" | "closed" | "draft";
+    prState?: PullRequestDisplayStatus;
     mode?: "manual_pr";
     createPrUrl?: string;
     head?: string;
@@ -26,6 +27,8 @@ export interface Artifact {
     repoName?: string;
   };
   createdAt: number;
+  /** Last content change (PR lifecycle updates); falls back to createdAt. */
+  updatedAt?: number;
 }
 
 export type SandboxEvent = SharedSandboxEvent;
@@ -34,10 +37,4 @@ export interface Task {
   content: string;
   status: "pending" | "in_progress" | "completed";
   activeForm?: string;
-}
-
-export interface FileChange {
-  filename: string;
-  additions: number;
-  deletions: number;
 }

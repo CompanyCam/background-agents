@@ -10,6 +10,7 @@ const generateWsTokenRequestSchema = z.object({
   scmUserId: nullableOptionalString,
   scmLogin: nullableOptionalString,
   scmName: nullableOptionalString,
+  authName: nullableOptionalString,
   scmEmail: nullableOptionalString,
   scmTokenEncrypted: nullableOptionalString,
   scmRefreshTokenEncrypted: nullableOptionalString,
@@ -27,16 +28,15 @@ export interface WsTokenHandlerDeps {
   generateId: (bytes?: number) => string;
   hashToken: (token: string) => Promise<string>;
   now: () => number;
-  getLog: () => Logger;
 }
 
 export interface WsTokenHandler {
-  generateWsToken: (request: Request) => Promise<Response>;
+  generateWsToken: (request: Request, log: Logger) => Promise<Response>;
 }
 
 export function createWsTokenHandler(deps: WsTokenHandlerDeps): WsTokenHandler {
   return {
-    async generateWsToken(request: Request): Promise<Response> {
+    async generateWsToken(request: Request, log: Logger): Promise<Response> {
       let raw: unknown;
       try {
         raw = await request.json();
@@ -81,6 +81,7 @@ export function createWsTokenHandler(deps: WsTokenHandlerDeps): WsTokenHandler {
           scmUserId: body.scmUserId ?? null,
           scmLogin: body.scmLogin ?? null,
           scmName: body.scmName ?? null,
+          authName: body.authName ?? null,
           scmEmail: body.scmEmail ?? null,
           scmAccessTokenEncrypted: shouldUpdateTokens ? (body.scmTokenEncrypted ?? null) : null,
           scmRefreshTokenEncrypted: shouldUpdateRefreshToken
@@ -96,6 +97,7 @@ export function createWsTokenHandler(deps: WsTokenHandlerDeps): WsTokenHandler {
           scmUserId: body.scmUserId ?? null,
           scmLogin: body.scmLogin ?? null,
           scmName: body.scmName ?? null,
+          authName: body.authName ?? null,
           scmEmail: body.scmEmail ?? null,
           scmAccessTokenEncrypted: body.scmTokenEncrypted ?? null,
           scmRefreshTokenEncrypted: body.scmRefreshTokenEncrypted ?? null,
@@ -110,9 +112,7 @@ export function createWsTokenHandler(deps: WsTokenHandlerDeps): WsTokenHandler {
       const tokenHash = await deps.hashToken(plainToken);
 
       deps.repository.updateParticipantWsToken(participant.id, tokenHash, now);
-      deps
-        .getLog()
-        .info("Generated WS token", { participant_id: participant.id, user_id: body.userId });
+      log.info("Generated WS token", { participant_id: participant.id, user_id: body.userId });
 
       return Response.json({
         token: plainToken,

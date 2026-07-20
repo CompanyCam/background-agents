@@ -4,7 +4,9 @@ import { useEffect, useState, type ReactNode } from "react";
 import useSWR, { mutate } from "swr";
 import { toast } from "sonner";
 import {
+  encodeRepositoryPathSegments,
   MODEL_REASONING_CONFIG,
+  parseRepositoryFullName,
   isValidReasoningEffort,
   type EnrichedRepository,
   type GitHubBotSettings,
@@ -38,6 +40,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import { CommitSigningSettings } from "./commit-signing-settings";
 
 const GLOBAL_SETTINGS_KEY = "/api/integration-settings/github";
 const REPO_SETTINGS_KEY = "/api/integration-settings/github/repos";
@@ -98,6 +101,8 @@ export function GitHubIntegrationSettings() {
           </p>
         )}
       </Section>
+
+      <CommitSigningSettings />
 
       <GlobalSettingsSection settings={settings} availableRepos={availableRepos} />
 
@@ -545,10 +550,11 @@ function RepoOverridesSection({
 
   const handleAdd = async () => {
     if (!addingRepo) return;
-    const [owner, name] = addingRepo.split("/");
+    const repository = parseRepositoryFullName(addingRepo);
+    if (!repository) return;
 
     try {
-      const res = await fetch(`/api/integration-settings/github/repos/${owner}/${name}`, {
+      const res = await fetch(`${REPO_SETTINGS_KEY}/${encodeRepositoryPathSegments(repository)}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ settings: {} }),
@@ -666,9 +672,9 @@ function RepoOverrideRow({
   };
 
   const handleSave = async () => {
+    const repository = parseRepositoryFullName(entry.repo);
+    if (!repository) return;
     setSaving(true);
-
-    const [owner, name] = entry.repo.split("/");
     const settings: GitHubBotSettings = {};
     if (model) settings.model = model;
     if (effort) settings.reasoningEffort = effort;
@@ -679,7 +685,7 @@ function RepoOverrideRow({
     if (autoReviewMode === "override") settings.autoReviewOnOpen = autoReviewOnOpen;
 
     try {
-      const res = await fetch(`/api/integration-settings/github/repos/${owner}/${name}`, {
+      const res = await fetch(`${REPO_SETTINGS_KEY}/${encodeRepositoryPathSegments(repository)}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ settings }),
@@ -701,10 +707,11 @@ function RepoOverrideRow({
   };
 
   const handleDelete = async () => {
-    const [owner, name] = entry.repo.split("/");
+    const repository = parseRepositoryFullName(entry.repo);
+    if (!repository) return;
 
     try {
-      const res = await fetch(`/api/integration-settings/github/repos/${owner}/${name}`, {
+      const res = await fetch(`${REPO_SETTINGS_KEY}/${encodeRepositoryPathSegments(repository)}`, {
         method: "DELETE",
       });
 

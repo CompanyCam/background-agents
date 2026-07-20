@@ -19,6 +19,27 @@ const SESSION_REPOSITORIES_TABLE_SQL = `CREATE TABLE IF NOT EXISTS session_repos
   PRIMARY KEY (repo_owner, repo_name)
 )`;
 
+const ATTACHMENTS_TABLE_SQL = `CREATE TABLE IF NOT EXISTS attachments (
+  id TEXT PRIMARY KEY,
+  mime_type TEXT NOT NULL,
+  size_bytes INTEGER NOT NULL,
+  object_key TEXT NOT NULL,
+  message_id TEXT,
+  cleanup_claimed_at INTEGER,
+  created_at INTEGER NOT NULL
+)`;
+
+const SESSION_DIFF_TABLE_SQL = `CREATE TABLE IF NOT EXISTS session_diff (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  revision_id TEXT,
+  trigger_message_id TEXT,
+  bundle_json TEXT,
+  captured_at INTEGER,
+  last_error TEXT,
+  error_at INTEGER,
+  updated_at INTEGER NOT NULL
+);`;
+
 export const SCHEMA_SQL = `
 -- Core session state
 CREATE TABLE IF NOT EXISTS session (
@@ -62,6 +83,7 @@ CREATE TABLE IF NOT EXISTS participants (
   scm_login TEXT,                                   -- SCM username
   scm_email TEXT,                                   -- For git commit attribution
   scm_name TEXT,                                    -- Display name for git commits
+  auth_name TEXT,                                   -- Provider-agnostic display name (e.g. Google/OIDC) for presence
   role TEXT NOT NULL DEFAULT 'member',              -- 'owner', 'member'
   -- Token storage (AES-GCM encrypted)
   scm_access_token_encrypted TEXT,
@@ -106,8 +128,14 @@ CREATE TABLE IF NOT EXISTS artifacts (
   type TEXT NOT NULL,                               -- 'pr', 'screenshot', 'video', 'preview', 'branch'
   url TEXT,
   metadata TEXT,                                    -- JSON
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL                       -- last content change (PR lifecycle updates)
 );
+
+-- User session attachments stored in the media bucket (chat composer attachments).
+-- message_id is set once a message references the attachment; unreferenced rows are
+-- pruned (with their R2 objects) after a TTL.
+${ATTACHMENTS_TABLE_SQL};
 
 -- Sandbox state
 CREATE TABLE IF NOT EXISTS sandbox (
@@ -142,6 +170,9 @@ CREATE TABLE IF NOT EXISTS sandbox (
 -- overlaid with the session scalar branch/sha columns at read time.
 ${SESSION_REPOSITORIES_TABLE_SQL};
 
+-- Latest durable checkout diff bundle. Source patches live only in this bounded row.
+${SESSION_DIFF_TABLE_SQL}
+
 -- WebSocket client mapping for hibernation recovery
 CREATE TABLE IF NOT EXISTS ws_client_mapping (
   ws_id TEXT PRIMARY KEY,
@@ -161,7 +192,7 @@ CREATE INDEX IF NOT EXISTS idx_participants_user ON participants(user_id);
 `;
 
 import { createLogger } from "../logger";
-import type { SqlStorage } from "./repository";
+import type { SqlStorage } from "./sql-storage";
 
 const schemaLog = createLogger("schema");
 
@@ -422,6 +453,32 @@ export const MIGRATIONS: readonly SchemaMigration[] = [
     id: 32,
     description: "Add environment_id to session (launch environment provenance)",
     run: `ALTER TABLE session ADD COLUMN environment_id TEXT`,
+  },
+  {
+    id: 33,
+    description: "Add auth_name to participants (provider-agnostic presence display name)",
+    run: `ALTER TABLE participants ADD COLUMN auth_name TEXT`,
+  },
+  {
+    id: 34,
+    description: "Add updated_at to artifacts (PR lifecycle tracking)",
+    // SQLite cannot ADD COLUMN with NOT NULL and no default, so migrated DOs
+    // get a nullable column plus a backfill; fresh DOs get NOT NULL from
+    // SCHEMA_SQL and createArtifact always writes it.
+    run: (sql) => {
+      runMigration(sql, `ALTER TABLE artifacts ADD COLUMN updated_at INTEGER`);
+      sql.exec(`UPDATE artifacts SET updated_at = created_at WHERE updated_at IS NULL`);
+    },
+  },
+  {
+    id: 35,
+    description: "Create attachments table",
+    run: ATTACHMENTS_TABLE_SQL,
+  },
+  {
+    id: 36,
+    description: "Add durable latest session diff bundle",
+    run: SESSION_DIFF_TABLE_SQL,
   },
 ];
 

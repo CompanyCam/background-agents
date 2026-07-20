@@ -1,5 +1,10 @@
 """Shared constants for sandbox modules."""
 
+# Provider-selected directory for standalone runtime commands. OpenComputer uses
+# the sandbox user's bin directory; providers with writable images use /usr/local/bin.
+BIN_INSTALL_DIR_ENV_VAR = "OPENINSPECT_BIN_INSTALL_DIR"
+DEFAULT_BIN_INSTALL_DIR = "/usr/local/bin"
+
 # Default service ports. The control plane may override the externally-exposed
 # ones per session via the *_ENV_VAR env vars below; the entrypoint and ttyd
 # proxy fall back to these defaults. TTYD_PORT is localhost-only and fixed — it
@@ -37,6 +42,6 @@ BOOT_WARNINGS_FILE_PATH = "/tmp/oi-boot-warnings.jsonl"
 # Canonical repository manifest written by the supervisor before any child
 # process starts, rewritten on every boot. Consumed by the bridge (push
 # targeting) and the JS create-pull-request tool so the /workspace checkout
-# layout has a single owner. JSON: {"repositories": [{owner, name, branch,
+# layout has a single authority. JSON: {"repositories": [{owner, name, branch,
 # path}]}. Mirrored as a string literal in plugins/inspect-plugin.js.
 REPO_MANIFEST_FILE_PATH = "/tmp/oi-repo-manifest.json"

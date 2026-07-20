@@ -31,6 +31,18 @@ export {
 
 // Modal provider
 export { ModalSandboxProvider, createModalProvider } from "./providers/modal-provider";
+export { E2BSandboxProvider, createE2BProvider } from "./providers/e2b-provider";
+export {
+  E2BRestClient,
+  E2BNotFoundError,
+  E2BConflictError,
+  E2BApiError,
+  createE2BRestClient,
+  type E2BRestConfig,
+  type E2BSandboxDetail,
+  type E2BSandboxCreated,
+  type E2BCreateSandboxParams,
+} from "./e2b-rest-client";
 export { DaytonaSandboxProvider, createDaytonaProvider } from "./providers/daytona-provider";
 export {
   OpenComputerSandboxProvider,
@@ -41,8 +53,6 @@ export {
   VercelSandboxProvider,
   createVercelProvider,
   type VercelProviderConfig,
-  type TriggerVercelRepoImageBuildConfig,
-  type TriggerVercelRepoImageBuildResult,
 } from "./providers/vercel/provider";
 export {
   VercelSandboxClient,
@@ -85,12 +95,7 @@ export {
   type OpenComputerCreateSandboxParams,
   type OpenComputerDeleteSandboxOptions,
 } from "./opencomputer-rest-client";
-export {
-  resolveSandboxBackendName,
-  isModalSandboxBackend,
-  supportsRepoImageBackend,
-  type SandboxBackendName,
-} from "./provider-name";
+export { resolveSandboxBackendName, type SandboxBackendName } from "./provider-name";
 
 // Lifecycle decisions
 export {

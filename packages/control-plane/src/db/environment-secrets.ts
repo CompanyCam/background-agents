@@ -11,68 +11,49 @@
  * round-trip is needed, and plaintext never transits the control plane.
  */
 
-import { encryptToken, decryptToken } from "../auth/crypto";
 import { createLogger } from "../logger";
 import {
-  MAX_TOTAL_VALUE_SIZE,
-  MAX_SECRETS_PER_SCOPE,
-  SecretsValidationError,
-  normalizeKey,
-  validateKey,
-  validateValue,
-} from "./secrets-validation";
+  SecretDecryptionError,
+  assertScopeKeyCapacity,
+  decryptSecretRows,
+  encryptSecretEntries,
+  prepareSecretsForWrite,
+  toSecretMetadata,
+} from "./scoped-secrets";
+import type { SecretsWriteResult } from "./scoped-secrets";
+import { normalizeKey, validateKey } from "./secrets-validation";
 import type { SecretMetadata } from "./secrets-validation";
+import type { SqlDatabase, SqlStatement } from "./sql-database";
 
 const log = createLogger("environment-secrets");
 
 export class EnvironmentSecretsStore {
   constructor(
-    private readonly db: D1Database,
+    private readonly db: SqlDatabase,
     private readonly encryptionKey: string
   ) {}
 
   async setSecrets(
     environmentId: string,
     secrets: Record<string, string>
-  ): Promise<{ created: number; updated: number; keys: string[] }> {
+  ): Promise<SecretsWriteResult> {
     const now = Date.now();
-
-    const normalized: Record<string, string> = {};
-    let totalValueBytes = 0;
-    for (const [rawKey, value] of Object.entries(secrets)) {
-      const key = normalizeKey(rawKey);
-      validateKey(key);
-      validateValue(value);
-      totalValueBytes += new TextEncoder().encode(value).length;
-      normalized[key] = value;
-    }
-
-    if (totalValueBytes > MAX_TOTAL_VALUE_SIZE) {
-      throw new SecretsValidationError(`Total secret size exceeds ${MAX_TOTAL_VALUE_SIZE} bytes`);
-    }
+    const normalized = prepareSecretsForWrite(secrets);
 
     const existingKeySet = await this.existingKeys(environmentId);
 
     const incomingKeys = Object.keys(normalized);
-    const netNew = incomingKeys.filter((k) => !existingKeySet.has(k)).length;
-    if (existingKeySet.size + netNew > MAX_SECRETS_PER_SCOPE) {
-      throw new SecretsValidationError(
-        `Environment would exceed ${MAX_SECRETS_PER_SCOPE} secrets limit ` +
-          `(current: ${existingKeySet.size}, adding: ${netNew})`
-      );
-    }
+    assertScopeKeyCapacity("Environment", existingKeySet, incomingKeys);
 
-    let created = 0;
-    let updated = 0;
+    const { entries, created, updated } = await encryptSecretEntries(
+      normalized,
+      existingKeySet,
+      this.encryptionKey
+    );
 
-    const statements: D1PreparedStatement[] = [];
-    for (const [key, value] of Object.entries(normalized)) {
-      const encrypted = await encryptToken(value, this.encryptionKey);
-      if (existingKeySet.has(key)) updated++;
-      else created++;
-
-      statements.push(this.bindUpsert(environmentId, key, encrypted, now));
-    }
+    const statements = entries.map((entry) =>
+      this.bindUpsert(environmentId, entry.key, entry.encryptedValue, now)
+    );
 
     if (statements.length > 0) {
       await this.db.batch(statements);
@@ -89,11 +70,7 @@ export class EnvironmentSecretsStore {
       .bind(environmentId)
       .all<{ key: string; created_at: number; updated_at: number }>();
 
-    return (result.results || []).map((row) => ({
-      key: row.key,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-    }));
+    return toSecretMetadata(result.results || []);
   }
 
   async getDecryptedSecrets(environmentId: string): Promise<Record<string, string>> {
@@ -102,24 +79,19 @@ export class EnvironmentSecretsStore {
       .bind(environmentId)
       .all<{ key: string; encrypted_value: string }>();
 
-    const rows = result.results || [];
-    const decryptedEntries = await Promise.all(
-      rows.map(async (row) => {
-        try {
-          const decryptedValue = await decryptToken(row.encrypted_value, this.encryptionKey);
-          return [row.key, decryptedValue] as const;
-        } catch (e) {
-          log.error("Failed to decrypt secret", {
-            environment_id: environmentId,
-            key: row.key,
-            error: e instanceof Error ? e.message : String(e),
-          });
-          throw new Error(`Failed to decrypt secret '${row.key}'`);
-        }
-      })
-    );
-
-    return Object.fromEntries(decryptedEntries);
+    try {
+      return await decryptSecretRows(result.results || [], this.encryptionKey);
+    } catch (e) {
+      if (e instanceof SecretDecryptionError) {
+        log.error("Failed to decrypt secret", {
+          environment_id: environmentId,
+          key: e.key,
+          error: e.cause instanceof Error ? e.cause.message : String(e.cause),
+        });
+        throw new Error(`Failed to decrypt secret '${e.key}'`);
+      }
+      throw e;
+    }
   }
 
   async deleteSecret(environmentId: string, key: string): Promise<boolean> {
@@ -134,7 +106,7 @@ export class EnvironmentSecretsStore {
   /**
    * Copy secrets from a member repo into this environment, ciphertext-verbatim.
    * When `keys` is omitted, imports every key the source repo has. Enforces the
-   * per-scope key cap; the combined-value byte cap is left to the launch-unit
+   * per-scope key cap; the combined-value byte cap is left to the session-target
    * fold at spawn/build time (PR-6) since measuring it here would require
    * decrypting the copied ciphertext.
    *
@@ -145,7 +117,7 @@ export class EnvironmentSecretsStore {
     environmentId: string,
     sourceRepoId: number,
     keys?: string[]
-  ): Promise<{ created: number; updated: number; keys: string[] }> {
+  ): Promise<SecretsWriteResult> {
     let query = "SELECT key, encrypted_value FROM repo_secrets WHERE repo_id = ?";
     const binds: unknown[] = [sourceRepoId];
 
@@ -165,13 +137,11 @@ export class EnvironmentSecretsStore {
     if (rows.length === 0) return { created: 0, updated: 0, keys: [] };
 
     const existingKeySet = await this.existingKeys(environmentId);
-    const netNew = rows.filter((r) => !existingKeySet.has(r.key)).length;
-    if (existingKeySet.size + netNew > MAX_SECRETS_PER_SCOPE) {
-      throw new SecretsValidationError(
-        `Environment would exceed ${MAX_SECRETS_PER_SCOPE} secrets limit ` +
-          `(current: ${existingKeySet.size}, adding: ${netNew})`
-      );
-    }
+    assertScopeKeyCapacity(
+      "Environment",
+      existingKeySet,
+      rows.map((r) => r.key)
+    );
 
     const now = Date.now();
     let created = 0;
@@ -199,7 +169,7 @@ export class EnvironmentSecretsStore {
     key: string,
     encryptedValue: string,
     now: number
-  ): D1PreparedStatement {
+  ): SqlStatement {
     return this.db
       .prepare(
         `INSERT INTO environment_secrets

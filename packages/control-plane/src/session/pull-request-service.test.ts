@@ -14,6 +14,13 @@ import {
   type PushBranchResult,
 } from "./pull-request-service";
 
+function artifactCreatedBroadcasts(deps: PullRequestServiceDeps) {
+  return vi
+    .mocked(deps.messenger.broadcast)
+    .mock.calls.map(([message]) => message)
+    .filter((message) => message.type === "artifact_created");
+}
+
 function createMockLogger(): Logger {
   return {
     debug: vi.fn(),
@@ -71,7 +78,8 @@ function createMockProvider() {
       id: 42,
       webUrl: "https://github.com/acme/web/pull/42",
       apiUrl: "https://api.github.com/repos/acme/web/pulls/42",
-      state: "open" as const,
+      lifecycleState: "open" as const,
+      isDraft: false,
       sourceBranch: "open-inspect/session-name-1",
       targetBranch: "main",
     })),
@@ -156,9 +164,12 @@ function createTestHarness() {
         url: data.url,
         metadata: data.metadata,
         created_at: data.createdAt,
+        updated_at: data.createdAt,
       } as ArtifactRow);
     },
   };
+
+  const sessionPullRequests = { upsert: vi.fn(async () => ({ applied: true })) };
 
   let idCounter = 0;
   const deps: PullRequestServiceDeps = {
@@ -168,9 +179,9 @@ function createTestHarness() {
     log,
     generateId: () => `id-${++idCounter}`,
     pushBranchToRemote: vi.fn(async () => ({ success: true as const })),
-    broadcastSessionBranch: vi.fn(),
-    broadcastArtifactCreated: vi.fn(),
+    messenger: { broadcast: vi.fn(), sendToSandbox: vi.fn(() => true) },
     appName: "Open-Inspect",
+    sessionPullRequests,
   };
 
   const service = new SessionPullRequestService(deps);
@@ -180,6 +191,8 @@ function createTestHarness() {
     deps,
     provider,
     artifacts,
+    sessionPullRequests,
+    log,
     setSession: (next: SessionRow | null) => {
       session = next;
     },
@@ -215,6 +228,7 @@ describe("SessionPullRequestService", () => {
       url: "https://github.com/acme/web/pull/1",
       metadata: null,
       created_at: Date.now(),
+      updated_at: Date.now(),
     });
 
     const result = await harness.service.createPullRequest(createInput());
@@ -243,7 +257,7 @@ describe("SessionPullRequestService", () => {
       status: 500,
       error: "Failed to push branch: timeout",
     });
-    expect(harness.deps.broadcastSessionBranch).not.toHaveBeenCalled();
+    expect(harness.deps.messenger.broadcast).not.toHaveBeenCalled();
   });
 
   it("creates PR with app auth when prompting auth is unavailable", async () => {
@@ -258,15 +272,17 @@ describe("SessionPullRequestService", () => {
     const createPrCall = (harness.provider.createPullRequest as ReturnType<typeof vi.fn>).mock
       .calls[0];
     expect(createPrCall[0]).toEqual({ authType: "app", token: "app-token" });
-    expect(harness.deps.broadcastArtifactCreated).toHaveBeenCalledTimes(1);
+    expect(artifactCreatedBroadcasts(harness.deps)).toHaveLength(1);
     expect(harness.deps.repository.updateSessionBranch).toHaveBeenCalledWith(
       "session-1",
       "open-inspect/session-name-1"
     );
-    expect(harness.deps.broadcastSessionBranch).toHaveBeenCalledWith(
-      "open-inspect/session-name-1",
-      { repoOwner: "acme", repoName: "web" }
-    );
+    expect(harness.deps.messenger.broadcast).toHaveBeenCalledWith({
+      type: "session_branch",
+      branchName: "open-inspect/session-name-1",
+      repoOwner: "acme",
+      repoName: "web",
+    });
   });
 
   it("uses the sanitized branch for push, PR creation, and branch sync", async () => {
@@ -301,7 +317,9 @@ describe("SessionPullRequestService", () => {
       "session-1",
       "feature/test"
     );
-    expect(harness.deps.broadcastSessionBranch).toHaveBeenCalledWith("feature/test", {
+    expect(harness.deps.messenger.broadcast).toHaveBeenCalledWith({
+      type: "session_branch",
+      branchName: "feature/test",
       repoOwner: "acme",
       repoName: "web",
     });
@@ -325,19 +343,25 @@ describe("SessionPullRequestService", () => {
     expect(createPrCall[1].body).toContain(
       "*Created with [Open-Inspect](https://app.example.com/session/session-name-1)*"
     );
-    expect(harness.deps.broadcastArtifactCreated).toHaveBeenCalledWith({
-      id: "id-1",
-      type: "pr",
-      url: "https://github.com/acme/web/pull/42",
-      metadata: {
-        number: 42,
-        state: "open",
-        head: "open-inspect/session-name-1",
-        base: "main",
-        repoOwner: "acme",
-        repoName: "web",
+    expect(harness.deps.messenger.broadcast).toHaveBeenCalledWith({
+      type: "artifact_created",
+      artifact: {
+        id: "id-1",
+        type: "pr",
+        url: "https://github.com/acme/web/pull/42",
+        metadata: {
+          number: 42,
+          state: "open",
+          lifecycleState: "open",
+          isDraft: false,
+          head: "open-inspect/session-name-1",
+          base: "main",
+          repoOwner: "acme",
+          repoName: "web",
+        },
+        createdAt: expect.any(Number),
+        updatedAt: expect.any(Number),
       },
-      createdAt: expect.any(Number),
     });
   });
 
@@ -360,8 +384,9 @@ describe("SessionPullRequestService", () => {
   it("syncs the branch after push and before PR creation", async () => {
     await harness.service.createPullRequest(createInput());
 
+    // The session_branch broadcast is the first messenger fan-out in the flow.
     const pushOrder = vi.mocked(harness.deps.pushBranchToRemote).mock.invocationCallOrder[0];
-    const syncOrder = vi.mocked(harness.deps.broadcastSessionBranch).mock.invocationCallOrder[0];
+    const syncOrder = vi.mocked(harness.deps.messenger.broadcast).mock.invocationCallOrder[0];
     const createPrOrder = (harness.provider.createPullRequest as ReturnType<typeof vi.fn>).mock
       .invocationCallOrder[0];
 
@@ -387,7 +412,7 @@ describe("SessionPullRequestService", () => {
     expect(harness.provider.buildGitPushSpec).not.toHaveBeenCalled();
     expect(harness.deps.pushBranchToRemote).not.toHaveBeenCalled();
     expect(harness.provider.createPullRequest).not.toHaveBeenCalled();
-    expect(harness.deps.broadcastSessionBranch).not.toHaveBeenCalled();
+    expect(harness.deps.messenger.broadcast).not.toHaveBeenCalled();
   });
 
   it("skips branch writes when the sanitized branch is unchanged but still broadcasts", async () => {
@@ -415,7 +440,9 @@ describe("SessionPullRequestService", () => {
         refspec: "HEAD:refs/heads/feature/test",
       })
     );
-    expect(harness.deps.broadcastSessionBranch).toHaveBeenCalledWith("feature/test", {
+    expect(harness.deps.messenger.broadcast).toHaveBeenCalledWith({
+      type: "session_branch",
+      branchName: "feature/test",
       repoOwner: "acme",
       repoName: "web",
     });
@@ -442,6 +469,7 @@ describe("SessionPullRequestService", () => {
         url: "https://github.com/acme/web/pull/1",
         metadata: JSON.stringify({ number: 1, repoOwner: "acme", repoName: "web" }),
         created_at: Date.now(),
+        updated_at: Date.now(),
       });
 
       const result = await harness.service.createPullRequest(
@@ -465,6 +493,7 @@ describe("SessionPullRequestService", () => {
         url: "https://github.com/acme/backend/pull/9",
         metadata: JSON.stringify({ number: 9, repoOwner: "acme", repoName: "backend" }),
         created_at: Date.now(),
+        updated_at: Date.now(),
       });
 
       const result = await harness.service.createPullRequest(
@@ -486,6 +515,7 @@ describe("SessionPullRequestService", () => {
         url: "https://github.com/acme/web/pull/1",
         metadata: JSON.stringify({ number: 1 }),
         created_at: Date.now(),
+        updated_at: Date.now(),
       });
 
       const primaryResult = await harness.service.createPullRequest(createInput());
@@ -545,10 +575,12 @@ describe("SessionPullRequestService", () => {
         "open-inspect/session-name-1"
       );
       expect(harness.deps.repository.updateSessionBranch).not.toHaveBeenCalled();
-      expect(harness.deps.broadcastSessionBranch).toHaveBeenCalledWith(
-        "open-inspect/session-name-1",
-        { repoOwner: "acme", repoName: "backend" }
-      );
+      expect(harness.deps.messenger.broadcast).toHaveBeenCalledWith({
+        type: "session_branch",
+        branchName: "open-inspect/session-name-1",
+        repoOwner: "acme",
+        repoName: "backend",
+      });
     });
 
     it("writes both the member row and the scalar mirror for the primary", async () => {
@@ -571,9 +603,12 @@ describe("SessionPullRequestService", () => {
         createInput({ repoOwner: "acme", repoName: "backend" })
       );
 
-      expect(harness.deps.broadcastArtifactCreated).toHaveBeenCalledWith(
+      expect(harness.deps.messenger.broadcast).toHaveBeenCalledWith(
         expect.objectContaining({
-          metadata: expect.objectContaining({ repoOwner: "acme", repoName: "backend" }),
+          type: "artifact_created",
+          artifact: expect.objectContaining({
+            metadata: expect.objectContaining({ repoOwner: "acme", repoName: "backend" }),
+          }),
         })
       );
     });
@@ -680,6 +715,7 @@ describe("SessionPullRequestService", () => {
         createPrUrl: "https://existing.example.com/manual-pr",
       }),
       created_at: Date.now(),
+      updated_at: Date.now(),
     });
 
     const result = await harness.service.createPullRequest(createInput({ promptingAuth: null }));
@@ -691,5 +727,164 @@ describe("SessionPullRequestService", () => {
       state: "open",
     });
     expect(harness.provider.createPullRequest).toHaveBeenCalledTimes(1);
+  });
+
+  describe("session pull request record (D1 authority)", () => {
+    it("writes the D1 record after the artifact and before the broadcast", async () => {
+      const result = await harness.service.createPullRequest(createInput());
+
+      expect(result.kind).toBe("created");
+      expect(harness.sessionPullRequests.upsert).toHaveBeenCalledTimes(1);
+      expect(harness.sessionPullRequests.upsert).toHaveBeenCalledWith({
+        artifactId: "id-1",
+        sessionId: "session-name-1",
+        repositoryExternalId: null,
+        repoOwner: "acme",
+        repoName: "web",
+        prNumber: 42,
+        url: "https://github.com/acme/web/pull/42",
+        lifecycleState: "open",
+        isDraft: false,
+        headBranch: "open-inspect/session-name-1",
+        baseBranch: "main",
+        headSha: null,
+        providerCreatedAt: null,
+        providerUpdatedAt: null,
+        mergedAt: null,
+        closedAt: null,
+        createdAt: expect.any(Number),
+        updatedAt: expect.any(Number),
+      });
+
+      const upsertOrder = harness.sessionPullRequests.upsert.mock.invocationCallOrder[0];
+      const broadcastMock = vi.mocked(harness.deps.messenger.broadcast).mock;
+      const artifactCreatedIndex = broadcastMock.calls.findIndex(
+        ([message]) => message.type === "artifact_created"
+      );
+      const broadcastOrder = broadcastMock.invocationCallOrder[artifactCreatedIndex];
+      expect(upsertOrder).toBeLessThan(broadcastOrder);
+    });
+
+    it("captures headSha and repositoryExternalId when the provider returns them", async () => {
+      vi.mocked(harness.provider.createPullRequest).mockResolvedValue({
+        id: 42,
+        webUrl: "https://github.com/acme/web/pull/42",
+        apiUrl: "https://api.github.com/repos/acme/web/pulls/42",
+        lifecycleState: "open",
+        isDraft: false,
+        sourceBranch: "open-inspect/session-name-1",
+        targetBranch: "main",
+        headSha: "abc123",
+        repositoryExternalId: "999",
+      });
+
+      await harness.service.createPullRequest(createInput());
+
+      expect(harness.sessionPullRequests.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          headSha: "abc123",
+          repositoryExternalId: "999",
+        })
+      );
+      expect(harness.deps.messenger.broadcast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: "artifact_created",
+          artifact: expect.objectContaining({
+            metadata: expect.objectContaining({
+              headSha: "abc123",
+              repositoryExternalId: "999",
+            }),
+          }),
+        })
+      );
+    });
+
+    it("seeds the monotonic guard with the provider's updated_at from creation", async () => {
+      vi.mocked(harness.provider.createPullRequest).mockResolvedValue({
+        id: 42,
+        webUrl: "https://github.com/acme/web/pull/42",
+        apiUrl: "https://api.github.com/repos/acme/web/pulls/42",
+        lifecycleState: "open",
+        isDraft: false,
+        sourceBranch: "open-inspect/session-name-1",
+        targetBranch: "main",
+        providerUpdatedAt: 1_720_000_000_000,
+      });
+
+      await harness.service.createPullRequest(createInput());
+
+      // A first webhook that raced ahead of this write can no longer be
+      // regressed by a timestamp-less (guard-authoritative) creation record.
+      expect(harness.sessionPullRequests.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({ providerUpdatedAt: 1_720_000_000_000 })
+      );
+      expect(harness.deps.messenger.broadcast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: "artifact_created",
+          artifact: expect.objectContaining({
+            metadata: expect.objectContaining({ providerUpdatedAt: 1_720_000_000_000 }),
+          }),
+        })
+      );
+    });
+
+    it("stores the provider's status facts for a draft creation, keeping the display state", async () => {
+      vi.mocked(harness.provider.createPullRequest).mockResolvedValue({
+        id: 42,
+        webUrl: "https://github.com/acme/web/pull/42",
+        apiUrl: "https://api.github.com/repos/acme/web/pulls/42",
+        lifecycleState: "open",
+        isDraft: true,
+        sourceBranch: "open-inspect/session-name-1",
+        targetBranch: "main",
+      });
+
+      await harness.service.createPullRequest(createInput());
+
+      expect(harness.sessionPullRequests.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({ lifecycleState: "open", isDraft: true })
+      );
+      expect(harness.deps.messenger.broadcast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: "artifact_created",
+          artifact: expect.objectContaining({
+            metadata: expect.objectContaining({
+              lifecycleState: "open",
+              isDraft: true,
+              state: "draft",
+            }),
+          }),
+        })
+      );
+    });
+
+    it("treats a D1 write failure as non-fatal", async () => {
+      harness.sessionPullRequests.upsert.mockRejectedValue(new Error("D1 unavailable"));
+
+      const result = await harness.service.createPullRequest(createInput());
+
+      expect(result).toEqual({
+        kind: "created",
+        prNumber: 42,
+        prUrl: "https://github.com/acme/web/pull/42",
+        state: "open",
+      });
+      expect(artifactCreatedBroadcasts(harness.deps)).toHaveLength(1);
+      expect(harness.log.error).toHaveBeenCalledWith(
+        "Failed to write session pull request record",
+        expect.objectContaining({ artifact_id: "id-1", pr_number: 42 })
+      );
+    });
+
+    it("skips the D1 write when no store is configured", async () => {
+      const deps = { ...harness.deps };
+      delete deps.sessionPullRequests;
+      const service = new SessionPullRequestService(deps);
+
+      const result = await service.createPullRequest(createInput());
+
+      expect(result.kind).toBe("created");
+      expect(harness.sessionPullRequests.upsert).not.toHaveBeenCalled();
+    });
   });
 });

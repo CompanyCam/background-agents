@@ -23,13 +23,13 @@ import {
   HttpError,
 } from "./routes/shared";
 import { integrationSettingsRoutes } from "./routes/integration-settings";
+import { commitSigningRoutes } from "./routes/commit-signing";
 import { modelPreferencesRoutes } from "./routes/model-preferences";
 import { reposRoutes } from "./routes/repos";
-import { repoImageRoutes } from "./routes/repo-images";
 import { secretsRoutes } from "./routes/secrets";
 import { environmentRoutes } from "./routes/environments";
 import { environmentSecretsRoutes } from "./routes/environment-secrets";
-import { environmentImageRoutes } from "./routes/environment-images";
+import { imageBuildRoutes } from "./routes/image-builds";
 import { automationRoutes } from "./routes/automations";
 import { mcpServerRoutes } from "./routes/mcp-servers";
 import { analyticsRoutes } from "./routes/analytics";
@@ -59,12 +59,10 @@ const PUBLIC_ROUTES: RegExp[] = [
   /^\/health$/,
   /^\/webhooks\/sentry\/[^/]+$/,
   /^\/webhooks\/automation\/[^/]+$/,
-  /^\/repo-images\/build-complete$/,
-  /^\/repo-images\/build-failed$/,
-  // Environment-image callbacks authenticate inside the workflow (internal
-  // HMAC for provider_image mode), same as the repo-image callbacks above.
-  /^\/environment-images\/build-complete$/,
-  /^\/environment-images\/build-failed$/,
+  // Image-build callbacks authenticate inside the workflow (internal HMAC
+  // for provider_image mode, per-build bearer token for provider_session).
+  /^\/image-builds\/build-complete$/,
+  /^\/image-builds\/build-failed$/,
 ];
 
 /**
@@ -78,10 +76,22 @@ const SANDBOX_AUTH_ROUTES: RegExp[] = [
   /^\/sessions\/[^/]+\/scm-credentials$/, // SCM credential broker for git credential helper
   /^\/sessions\/[^/]+\/tunnel-urls$/, // Tunnel URL fetch for sandboxes whose .tunnels.env write isn't visible from inside
   /^\/sessions\/[^/]+\/media$/, // Media upload from sandbox
+  /^\/sessions\/[^/]+\/attachments\/[^/]+$/, // Session attachment download from sandbox bridge
   /^\/sessions\/[^/]+\/children$/, // POST spawn, GET list
   /^\/sessions\/[^/]+\/children\/[^/]+$/, // GET child detail
   /^\/sessions\/[^/]+\/children\/[^/]+\/cancel$/, // POST cancel child
   /^\/sessions\/[^/]+\/slack-notify$/, // Agent-initiated Slack notification
+];
+
+/** Routes that require the session-specific sandbox token and reject internal HMAC auth. */
+const SANDBOX_AUTH_ONLY_ROUTES: RegExp[] = [
+  /^\/sessions\/[^/]+\/commit-signing$/, // Public signing configuration and remote signer
+];
+
+/** Diff endpoints the sandbox needs, constrained by both path and method. */
+const SANDBOX_DIFF_AUTH_ROUTES: ReadonlyArray<{ method: string; pattern: RegExp }> = [
+  { method: "PUT", pattern: /^\/sessions\/[^/]+\/diff$/ },
+  { method: "POST", pattern: /^\/sessions\/[^/]+\/diff\/failure$/ },
 ];
 
 type CachedScmProvider =
@@ -134,17 +144,25 @@ function isPublicRoute(path: string): boolean {
 /**
  * Check if a path matches any sandbox auth route pattern.
  */
-function isSandboxAuthRoute(path: string): boolean {
-  return SANDBOX_AUTH_ROUTES.some((pattern) => pattern.test(path));
+function isSandboxAuthRoute(path: string, method: string): boolean {
+  return (
+    SANDBOX_AUTH_ROUTES.some((pattern) => pattern.test(path)) ||
+    SANDBOX_DIFF_AUTH_ROUTES.some((route) => route.method === method && route.pattern.test(path))
+  );
+}
+
+function isSandboxAuthOnlyRoute(path: string): boolean {
+  return SANDBOX_AUTH_ONLY_ROUTES.some((pattern) => pattern.test(path));
 }
 
 function isScmAgnosticRoute(path: string): boolean {
   return (
-    /^\/analytics\/(summary|timeseries|breakdown)$/.test(path) ||
+    /^\/analytics\/(summary|timeseries|breakdown|pull-requests)$/.test(path) ||
     // Identity upserts are independent of the SCM provider. Only the known auth
     // providers are agnostic; an unimplemented SCM (e.g. gitlab) still 501s.
     /^\/provider-identities\/(github|slack|linear|google)\/[^/]+$/.test(path) ||
-    /^\/sessions\/[^/]+\/tunnel-urls$/.test(path)
+    /^\/sessions\/[^/]+\/(tunnel-urls|commit-signing)$/.test(path) ||
+    /^\/sessions\/[^/]+\/diff(?:\/.*)?$/.test(path)
   );
 }
 
@@ -254,14 +272,12 @@ async function verifySandboxAuth(
  *
  * @param request - The incoming request
  * @param env - Environment bindings
- * @param path - Request path for logging
  * @param ctx - Request correlation context
  * @returns null if authentication passes, or an error Response to return immediately
  */
 async function requireInternalAuth(
   request: Request,
   env: Env,
-  path: string,
   ctx: RequestContext
 ): Promise<Response | null> {
   if (!env.INTERNAL_CALLBACK_SECRET) {
@@ -279,14 +295,6 @@ async function requireInternalAuth(
   );
 
   if (!isValid) {
-    const clientIP = request.headers.get("CF-Connecting-IP") || "unknown";
-    logger.warn("Auth failed: HMAC", {
-      event: "auth.hmac_failed",
-      http_path: path,
-      client_ip: clientIP,
-      request_id: ctx.request_id,
-      trace_id: ctx.trace_id,
-    });
     return error("Unauthorized", 401);
   }
 
@@ -319,10 +327,12 @@ const routes: Route[] = [
   // Secrets
   ...secretsRoutes,
 
-  // Environments (Phase-2 launch unit; internal-HMAC only, web BFF proxied)
+  // Environments (Phase-2 session target; internal-HMAC only, web BFF proxied)
   ...environmentRoutes,
   ...environmentSecretsRoutes,
-  ...environmentImageRoutes,
+
+  // Image builds (scope-generic)
+  ...imageBuildRoutes,
 
   // Model preferences
   ...modelPreferencesRoutes,
@@ -330,8 +340,8 @@ const routes: Route[] = [
   // Integration settings
   ...integrationSettingsRoutes,
 
-  // Repo image builds
-  ...repoImageRoutes,
+  // Deployment-wide commit signing identity
+  ...commitSigningRoutes,
 
   // Automations
   ...automationRoutes,
@@ -362,17 +372,31 @@ export async function handleRequest(
   const method = request.method;
   const startTime = Date.now();
 
-  // Build correlation context with per-request metrics
+  // The DB binding is required (types.ts) and the control plane cannot serve
+  // requests without it. Reject a missing binding once here — the single
+  // honest boundary — so ctx.db is genuinely always present in handlers and
+  // no per-route degraded-mode guards are needed.
+  // eslint-disable-next-line no-restricted-syntax -- composition root: the one route-layer env.DB read
+  if (!env.DB) {
+    logger.error("DB binding is not configured; refusing request", { http_path: path });
+    return new Response(JSON.stringify({ error: "Database not configured" }), {
+      status: 503,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  // Build correlation context with per-request metrics and the instrumented
+  // database handle. Handlers use ctx.db (never env.DB) so all queries are
+  // automatically timed.
   const metrics = createRequestMetrics();
   const ctx: RequestContext = {
     trace_id: request.headers.get("x-trace-id") || crypto.randomUUID(),
     request_id: crypto.randomUUID().slice(0, 8),
     metrics,
+    // eslint-disable-next-line no-restricted-syntax -- composition root: the one route-layer env.DB read
+    db: instrumentD1(env.DB, metrics),
     executionCtx,
   };
-
-  // Instrument D1 so all queries are automatically timed
-  const instrumentedEnv: Env = { ...env, DB: instrumentD1(env.DB, metrics) };
 
   // CORS preflight
   if (method === "OPTIONS") {
@@ -390,28 +414,42 @@ export async function handleRequest(
 
   // Require authentication for non-public routes
   if (!isPublicRoute(path)) {
-    // First try HMAC auth (for web app, slack bot, etc.)
-    const hmacAuthError = await requireInternalAuth(request, env, path, ctx);
+    const requiresSandboxAuth = isSandboxAuthOnlyRoute(path);
+    let hmacAuthError: Response | null = null;
+    let authError: Response | null;
 
-    if (hmacAuthError) {
-      // HMAC auth failed - check if this route accepts sandbox auth
-      if (isSandboxAuthRoute(path)) {
+    if (requiresSandboxAuth) {
+      const sessionIdMatch = path.match(/^\/sessions\/([^/]+)\//);
+      authError = sessionIdMatch
+        ? await verifySandboxAuth(request, env, sessionIdMatch[1], ctx)
+        : error("Unauthorized: Invalid session path", 401);
+    } else {
+      const acceptsSandboxAuth = isSandboxAuthRoute(path, method);
+      // First try HMAC auth (for web app, slack bot, etc.)
+      hmacAuthError = await requireInternalAuth(request, env, ctx);
+      authError = hmacAuthError;
+
+      if (hmacAuthError && acceptsSandboxAuth) {
         // Extract session ID from path (e.g., /sessions/abc123/pr -> abc123)
         const sessionIdMatch = path.match(/^\/sessions\/([^/]+)\//);
         if (sessionIdMatch) {
-          const sessionId = sessionIdMatch[1];
-          const sandboxAuthError = await verifySandboxAuth(request, env, sessionId, ctx);
-          if (!sandboxAuthError) {
-            // Sandbox auth passed, continue to route handler
-          } else {
-            // Both HMAC and sandbox auth failed
-            return withCorsAndTraceHeaders(sandboxAuthError, ctx);
-          }
+          authError = await verifySandboxAuth(request, env, sessionIdMatch[1], ctx);
         }
-      } else {
-        // Not a sandbox auth route, return HMAC auth error
-        return withCorsAndTraceHeaders(hmacAuthError, ctx);
       }
+    }
+
+    if (authError) {
+      if (hmacAuthError?.status === 401) {
+        const clientIP = request.headers.get("CF-Connecting-IP") || "unknown";
+        logger.warn("Auth failed: HMAC", {
+          event: "auth.hmac_failed",
+          http_path: path,
+          client_ip: clientIP,
+          request_id: ctx.request_id,
+          trace_id: ctx.trace_id,
+        });
+      }
+      return withCorsAndTraceHeaders(authError, ctx);
     }
   }
 
@@ -429,7 +467,7 @@ export async function handleRequest(
       let response: Response;
       let outcome: "success" | "error";
       try {
-        response = await route.handler(request, instrumentedEnv, match, ctx);
+        response = await route.handler(request, env, match, ctx);
         outcome = response.status >= 500 ? "error" : "success";
       } catch (e) {
         if (e instanceof HttpError) {

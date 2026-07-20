@@ -1,8 +1,9 @@
 /**
- * SessionRepository - Database operations for Session Durable Objects.
+ * SessionRepository - Core session aggregate persistence.
  *
- * Consolidates all SQL operations from SessionDO into a single class
- * to enable unit testing via mock injection and reduce coupling.
+ * Feature-specific persistence can live in focused repositories that share
+ * the same session-local SQL store. Cross-repository transactions remain
+ * coordinated here when they also create or update core session records.
  */
 
 import type {
@@ -30,6 +31,8 @@ import {
   type EventTimelineCursor,
 } from "./event-cursor";
 import { buildSessionRepositories, type SessionRepositoryEntry } from "./repository-target";
+import type { SessionAttachmentRepository } from "./session-attachment-repository";
+import type { SqlResult, SqlStorage, TransactionSync } from "./sql-storage";
 
 type TokenEvent = Extract<SandboxEvent, { type: "token" }>;
 type ExecutionCompleteEvent = Extract<SandboxEvent, { type: "execution_complete" }>;
@@ -44,6 +47,7 @@ export interface WsClientMappingResult {
   user_id: string;
   scm_name: string | null;
   scm_login: string | null;
+  auth_name: string | null;
 }
 
 /**
@@ -130,6 +134,7 @@ export interface CreateParticipantData {
   scmUserId?: string | null;
   scmLogin?: string | null;
   scmName?: string | null;
+  authName?: string | null;
   scmEmail?: string | null;
   scmAccessTokenEncrypted?: string | null;
   scmRefreshTokenEncrypted?: string | null;
@@ -145,6 +150,7 @@ export interface UpdateParticipantData {
   scmUserId?: string | null;
   scmLogin?: string | null;
   scmName?: string | null;
+  authName?: string | null;
   scmEmail?: string | null;
   scmAccessTokenEncrypted?: string | null;
   scmRefreshTokenEncrypted?: string | null;
@@ -227,6 +233,15 @@ export interface CreateArtifactData {
 }
 
 /**
+ * Data for updating an artifact's content in place (PR lifecycle updates).
+ */
+export interface UpdateArtifactData {
+  url: string;
+  metadata: string | null;
+  updatedAt: number;
+}
+
+/**
  * Data for WS client mapping.
  */
 export interface WsClientMappingData {
@@ -252,25 +267,14 @@ export interface ResumeSandboxData {
 }
 
 /**
- * SqlStorage interface matching Cloudflare's SqlStorage.
- * Used to allow mock injection for testing.
- */
-export interface SqlStorage {
-  exec(query: string, ...params: unknown[]): SqlResult;
-}
-
-export interface SqlResult {
-  toArray(): unknown[];
-  one(): unknown;
-  readonly rowsRead?: number;
-  readonly rowsWritten?: number;
-}
-
-/**
- * SessionRepository encapsulates all database operations for a session.
+ * Core database operations for a session Durable Object.
  */
 export class SessionRepository {
-  constructor(private readonly sql: SqlStorage) {}
+  constructor(
+    private readonly sql: SqlStorage,
+    private readonly transactionSync: TransactionSync,
+    private readonly attachments: Pick<SessionAttachmentRepository, "claimForMessage">
+  ) {}
 
   private rows<T>(result: SqlResult): T[] {
     return result.toArray() as T[];
@@ -431,6 +435,44 @@ export class SessionRepository {
       repoOwner,
       repoName
     );
+  }
+
+  setSessionDiffBaselines(
+    repositories: Array<{
+      position: number;
+      repoOwner: string;
+      repoName: string;
+      baseSha: string;
+      isPrimary: boolean;
+    }>
+  ): void {
+    this.transactionSync(() => {
+      for (const repository of repositories) {
+        this.sql.exec(
+          `UPDATE session_repositories
+           SET base_sha = ?
+           WHERE position = ?
+             AND repo_owner = ? COLLATE NOCASE
+             AND repo_name = ? COLLATE NOCASE
+             AND base_sha IS NULL`,
+          repository.baseSha,
+          repository.position,
+          repository.repoOwner,
+          repository.repoName
+        );
+        if (repository.isPrimary) {
+          this.sql.exec(
+            `UPDATE session SET base_sha = ?
+             WHERE repo_owner = ? COLLATE NOCASE
+               AND repo_name = ? COLLATE NOCASE
+               AND base_sha IS NULL`,
+            repository.baseSha,
+            repository.repoOwner,
+            repository.repoName
+          );
+        }
+      }
+    });
   }
 
   // === SANDBOX ===
@@ -623,13 +665,14 @@ export class SessionRepository {
 
   createParticipant(data: CreateParticipantData): void {
     this.sql.exec(
-      `INSERT INTO participants (id, user_id, scm_user_id, scm_login, scm_name, scm_email, scm_access_token_encrypted, scm_refresh_token_encrypted, scm_token_expires_at, role, joined_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO participants (id, user_id, scm_user_id, scm_login, scm_name, auth_name, scm_email, scm_access_token_encrypted, scm_refresh_token_encrypted, scm_token_expires_at, role, joined_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       data.id,
       data.userId,
       data.scmUserId ?? null,
       data.scmLogin ?? null,
       data.scmName ?? null,
+      data.authName ?? null,
       data.scmEmail ?? null,
       data.scmAccessTokenEncrypted ?? null,
       data.scmRefreshTokenEncrypted ?? null,
@@ -645,6 +688,7 @@ export class SessionRepository {
          scm_user_id = COALESCE(?, scm_user_id),
          scm_login = COALESCE(?, scm_login),
          scm_name = COALESCE(?, scm_name),
+         auth_name = COALESCE(?, auth_name),
          scm_email = COALESCE(?, scm_email),
          scm_access_token_encrypted = COALESCE(?, scm_access_token_encrypted),
          scm_refresh_token_encrypted = COALESCE(?, scm_refresh_token_encrypted),
@@ -653,6 +697,7 @@ export class SessionRepository {
       data.scmUserId ?? null,
       data.scmLogin ?? null,
       data.scmName ?? null,
+      data.authName ?? null,
       data.scmEmail ?? null,
       data.scmAccessTokenEncrypted ?? null,
       data.scmRefreshTokenEncrypted ?? null,
@@ -770,6 +815,14 @@ export class SessionRepository {
       data.status,
       data.createdAt
     );
+  }
+
+  /** Persist a message and claim all referenced attachments in one SQLite transaction. */
+  createMessageWithAttachments(data: CreateMessageData, attachmentIds: string[]): void {
+    this.transactionSync(() => {
+      this.attachments.claimForMessage(data.id, attachmentIds);
+      this.createMessage(data);
+    });
   }
 
   updateMessageToProcessing(messageId: string, startedAt: number): void {
@@ -952,14 +1005,26 @@ export class SessionRepository {
   // === ARTIFACTS ===
 
   createArtifact(data: CreateArtifactData): void {
+    // updated_at starts at created_at; only content changes advance it.
     this.sql.exec(
-      `INSERT INTO artifacts (id, type, url, metadata, created_at)
-       VALUES (?, ?, ?, ?, ?)`,
+      `INSERT INTO artifacts (id, type, url, metadata, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
       data.id,
       data.type,
       data.url,
       data.metadata,
+      data.createdAt,
       data.createdAt
+    );
+  }
+
+  updateArtifact(artifactId: string, data: UpdateArtifactData): void {
+    this.sql.exec(
+      `UPDATE artifacts SET url = ?, metadata = ?, updated_at = ? WHERE id = ?`,
+      data.url,
+      data.metadata,
+      data.updatedAt,
+      artifactId
     );
   }
 
@@ -989,7 +1054,7 @@ export class SessionRepository {
 
   getWsClientMapping(wsId: string): WsClientMappingResult | null {
     const result = this.sql.exec(
-      `SELECT m.participant_id, m.client_id, p.user_id, p.scm_name, p.scm_login
+      `SELECT m.participant_id, m.client_id, p.user_id, p.scm_name, p.scm_login, p.auth_name
        FROM ws_client_mapping m
        JOIN participants p ON m.participant_id = p.id
        WHERE m.ws_id = ?`,

@@ -1,5 +1,6 @@
 import type { RepoMetadata } from "@open-inspect/shared";
 import { parseJsonStringArray } from "./json-columns";
+import type { SqlDatabase } from "./sql-database";
 
 /** D1 batch() supports at most 100 statements per call. */
 const D1_BATCH_LIMIT = 100;
@@ -37,7 +38,7 @@ function toMetadata(row: RepoMetadataRow): RepoMetadata {
 }
 
 export class RepoMetadataStore {
-  constructor(private readonly db: D1Database) {}
+  constructor(private readonly db: SqlDatabase) {}
 
   async get(owner: string, name: string): Promise<RepoMetadata | null> {
     const row = await this.db
@@ -108,6 +109,18 @@ export class RepoMetadataStore {
     }
 
     return map;
+  }
+
+  /** False when no repo_metadata row exists — an unknown repo is never prebuild-enabled. */
+  async getImageBuildEnabled(owner: string, name: string): Promise<boolean> {
+    const row = await this.db
+      .prepare(
+        "SELECT image_build_enabled FROM repo_metadata WHERE repo_owner = ? AND repo_name = ?"
+      )
+      .bind(owner.toLowerCase(), name.toLowerCase())
+      .first<{ image_build_enabled: number }>();
+
+    return row?.image_build_enabled === 1;
   }
 
   async getImageBuildEnabledRepos(): Promise<ImageBuildEnabledRepo[]> {

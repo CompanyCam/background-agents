@@ -2,8 +2,10 @@
  * Shared route primitives used by all route modules.
  */
 
+import { decodeRepositoryPathSegments } from "@open-inspect/shared";
 import type { CorrelationContext } from "../logger";
 import type { RequestMetrics } from "../db/instrumented-d1";
+import type { SqlDatabase } from "../db/sql-database";
 import type { Env } from "../types";
 import type { Logger } from "../logger";
 import {
@@ -18,6 +20,13 @@ import {
  */
 export type RequestContext = CorrelationContext & {
   metrics: RequestMetrics;
+  /**
+   * The request's database handle (the DB binding wrapped with query
+   * instrumentation). Route handlers must use this instead of the raw binding
+   * so every query is timed — an ESLint rule forbids `.DB` access under
+   * src/routes and src/webhooks.
+   */
+  db: SqlDatabase;
   /** Worker ExecutionContext for waitUntil (background tasks). */
   executionCtx?: ExecutionContext;
 };
@@ -145,12 +154,16 @@ export async function parseJsonBody<T>(request: Request): Promise<T | Response> 
 export function extractRepoParams(
   match: RegExpMatchArray
 ): { owner: string; name: string } | Response {
-  const owner = match.groups?.owner;
-  const name = match.groups?.name;
-  if (!owner || !name) {
+  const encodedOwner = match.groups?.owner;
+  const encodedName = match.groups?.name;
+  if (!encodedOwner || !encodedName) {
     return error("Owner and name are required", 400);
   }
-  return { owner, name };
+  const repository = decodeRepositoryPathSegments(encodedOwner, encodedName);
+  if (!repository) {
+    return error("Owner and name must be valid repository path segments", 400);
+  }
+  return { owner: repository.repoOwner, name: repository.repoName };
 }
 
 /**

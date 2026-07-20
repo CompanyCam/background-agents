@@ -120,6 +120,7 @@ built for internal use where all employees are trusted and have access to compan
 | [sandbox-runtime](packages/sandbox-runtime)       | Shared in-sandbox agent runtime             |
 | [modal-infra](packages/modal-infra)               | Modal sandbox infrastructure                |
 | [daytona-infra](packages/daytona-infra)           | Daytona snapshot infrastructure             |
+| [e2b-infra](packages/e2b-infra)                   | E2B sandbox template infrastructure         |
 | [opencomputer-infra](packages/opencomputer-infra) | OpenComputer template infrastructure        |
 | [slack-bot](packages/slack-bot)                   | Slack integration (sessions from messages)  |
 | [github-bot](packages/github-bot)                 | GitHub integration (auto-review, @mention)  |
@@ -160,7 +161,7 @@ One session can work across several repositories in a single sandbox:
 - **Environments** — Save a repository set as a named environment with its own secrets scope and
   optional prebuilt images, then launch it from the picker like any repository
 - See [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#environments) for the model and
-  [docs/IMAGE_PREBUILD.md](docs/IMAGE_PREBUILD.md#environment-images) for environment prebuilds
+  [docs/IMAGE_PREBUILD.md](docs/IMAGE_PREBUILD.md) for environment prebuilds
 
 ### Multiplayer Sessions
 
@@ -266,9 +267,9 @@ docker compose up -d postgres redis
 ```
 
 - `setup.sh` runs for image builds and fresh sessions
-- `setup.sh` is skipped for repo-image and snapshot-restore starts
+- `setup.sh` is skipped for prebuilt-image and snapshot-restore starts
 - `setup.sh` failures are non-fatal for fresh sessions, but fatal in image build mode
-- `start.sh` runs for every non-build session startup (fresh, repo-image, snapshot-restore)
+- `start.sh` runs for every non-build session startup (fresh, prebuilt-image, snapshot-restore)
 - `start.sh` failures are strict: if present and it fails, session startup fails
 - Default timeouts:
   - `SETUP_TIMEOUT_SECONDS` (default `300`)
@@ -290,6 +291,7 @@ built with:
 - [Daytona](https://www.daytona.io) - Cloud development sandboxes
 - [Vercel Sandbox](https://vercel.com/docs/vercel-sandbox) - Cloud sandbox infrastructure
 - [OpenComputer](https://www.opencomputer.dev) - Cloud sandbox infrastructure
+- [E2B](https://e2b.dev) - Cloud sandbox infrastructure
 - [Cloudflare Workers](https://workers.cloudflare.com) - Edge computing
 - [OpenCode](https://opencode.ai) - Coding agent runtime
 - [Next.js](https://nextjs.org) - Web framework

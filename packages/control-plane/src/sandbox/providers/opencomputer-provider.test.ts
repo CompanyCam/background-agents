@@ -267,6 +267,85 @@ describe("OpenComputerSandboxProvider", () => {
     });
   });
 
+  it("maps bitbucket to the Bitbucket clone identity", async () => {
+    // OpenComputer historically collapsed bitbucket to the GitHub identity (a
+    // pre-Bitbucket-support drift that made bitbucket clones impossible); it
+    // now resolves the real Bitbucket identity like every provider.
+    const client = createMockClient();
+    const provider = new OpenComputerSandboxProvider(client, {
+      scmProvider: "bitbucket",
+      codeServerPasswordSecret: "secret",
+    });
+
+    await provider.createSandbox({
+      ...baseConfig,
+      userEnvVars: { VCS_CLONE_TOKEN: "bb-token" },
+    });
+
+    const createCall = vi.mocked(client.createSandbox).mock.calls[0][0];
+    expect(createCall.env).toMatchObject({
+      VCS_HOST: "bitbucket.org",
+      VCS_CLONE_USERNAME: "x-token-auth",
+    });
+    expect(client.setSecret).toHaveBeenCalledWith({
+      storeId: "secret-store-1",
+      name: "VCS_CLONE_TOKEN",
+      value: "bb-token",
+      allowedHosts: ["bitbucket.org", "api.bitbucket.org"],
+    });
+  });
+
+  it("keeps GITHUB-named secrets scoped to GitHub hosts on non-GitHub providers", async () => {
+    const client = createMockClient();
+    const provider = new OpenComputerSandboxProvider(client, {
+      scmProvider: "bitbucket",
+      codeServerPasswordSecret: "secret",
+    });
+
+    await provider.createSandbox({
+      ...baseConfig,
+      userEnvVars: { GITHUB_TOKEN: "gh-token" },
+    });
+
+    expect(client.setSecret).toHaveBeenCalledWith({
+      storeId: "secret-store-1",
+      name: "GITHUB_TOKEN",
+      value: "gh-token",
+      allowedHosts: ["github.com", "api.github.com"],
+    });
+  });
+
+  it("uses the Bitbucket clone identity for image builds", async () => {
+    const client = createMockClient();
+    const provider = new OpenComputerSandboxProvider(client, {
+      scmProvider: "bitbucket",
+      codeServerPasswordSecret: "secret",
+    });
+
+    await provider.triggerEnvironmentImageBuild({
+      buildId: "build-bb",
+      environmentId: "env_flagship",
+      repositories: [{ repoOwner: "acme", repoName: "repo", baseBranch: "main" }],
+      callbackUrl: "https://control.example/image-builds/build-complete",
+      failureCallbackUrl: "https://control.example/image-builds/build-failed",
+      callbackToken: "callback-token",
+      cloneToken: "clone-token",
+      userEnvVars: {},
+      onProviderSessionCreated: vi.fn(async () => undefined),
+    });
+
+    expect(client.createSandbox).toHaveBeenCalledWith(
+      expect.objectContaining({
+        env: expect.objectContaining({
+          IMAGE_BUILD_MODE: "true",
+          VCS_HOST: "bitbucket.org",
+          VCS_CLONE_USERNAME: "x-token-auth",
+          VCS_CLONE_TOKEN: "clone-token",
+        }),
+      })
+    );
+  });
+
   it("cleans up a created sandbox when runtime startup fails", async () => {
     const client = createMockClient({
       startRuntime: vi.fn(async () => {
@@ -561,7 +640,7 @@ describe("OpenComputerSandboxProvider", () => {
     );
   });
 
-  it("starts repo image builds with callback provider session env", async () => {
+  it("starts image builds with callback provider session env and reserved-key stripping", async () => {
     const client = createMockClient();
     const onProviderSessionCreated = vi.fn(async () => undefined);
     const provider = new OpenComputerSandboxProvider(client, {
@@ -570,12 +649,12 @@ describe("OpenComputerSandboxProvider", () => {
       llmEnvVars: { ANTHROPIC_API_KEY: "sk-provider" },
     });
 
-    await provider.triggerRepoImageBuild({
+    await provider.triggerEnvironmentImageBuild({
       buildId: "build-1",
-      repoOwner: "acme",
-      repoName: "repo",
-      defaultBranch: "main",
-      callbackUrl: "https://control.example/repo-images/build-complete",
+      environmentId: "env_flagship",
+      repositories: [{ repoOwner: "acme", repoName: "repo", baseBranch: "main" }],
+      callbackUrl: "https://control.example/image-builds/build-complete",
+      failureCallbackUrl: "https://control.example/image-builds/build-failed",
       callbackToken: "callback-token",
       cloneToken: "clone-token",
       userEnvVars: {
@@ -592,13 +671,14 @@ describe("OpenComputerSandboxProvider", () => {
         env: expect.objectContaining({
           IMAGE_BUILD_MODE: "true",
           OI_REPO_IMAGE_BUILD_ID: "build-1",
-          OI_REPO_IMAGE_CALLBACK_URL: "https://control.example/repo-images/build-complete",
+          OI_REPO_IMAGE_CALLBACK_URL: "https://control.example/image-builds/build-complete",
           OI_REPO_IMAGE_CALLBACK_TOKEN: "callback-token",
+          OI_REPO_IMAGE_FAILURE_CALLBACK_URL: "https://control.example/image-builds/build-failed",
           VCS_CLONE_TOKEN: "clone-token",
           ANTHROPIC_API_KEY: "sk-repo",
         }),
         labels: expect.objectContaining({
-          openinspect_kind: "repo-image-build",
+          openinspect_kind: "environment-image-build",
           openinspect_build_id: "build-1",
         }),
       })
@@ -640,6 +720,7 @@ describe("OpenComputerSandboxProvider", () => {
         { repoOwner: "acme", repoName: "api", baseBranch: "develop" },
       ],
       callbackUrl: "https://control.example/environment-images/build-complete",
+      failureCallbackUrl: "https://control.example/environment-images/build-failed",
       callbackToken: "callback-token",
       cloneToken: "clone-token",
       onProviderSessionCreated,
@@ -656,6 +737,7 @@ describe("OpenComputerSandboxProvider", () => {
       OI_REPO_IMAGE_BUILD_ID: "envimg-1",
       OI_REPO_IMAGE_CALLBACK_URL: "https://control.example/environment-images/build-complete",
       OI_REPO_IMAGE_CALLBACK_TOKEN: "callback-token",
+      OI_REPO_IMAGE_FAILURE_CALLBACK_URL: "https://control.example/environment-images/build-failed",
     });
     expect(JSON.parse(createCall.env!.SESSION_CONFIG)).toEqual({
       branch: "main",
@@ -674,7 +756,7 @@ describe("OpenComputerSandboxProvider", () => {
     });
   });
 
-  it("cleans up a repo image build sandbox when runtime startup fails", async () => {
+  it("cleans up an image build sandbox when runtime startup fails", async () => {
     const client = createMockClient({
       startRuntime: vi.fn(async () => {
         throw new Error("runtime failed");
@@ -686,15 +768,15 @@ describe("OpenComputerSandboxProvider", () => {
     });
 
     await expect(
-      provider.triggerRepoImageBuild({
+      provider.triggerEnvironmentImageBuild({
         buildId: "build-1",
-        repoOwner: "acme",
-        repoName: "repo",
-        defaultBranch: "main",
-        callbackUrl: "https://control.example/repo-images/build-complete",
+        environmentId: "env_flagship",
+        repositories: [{ repoOwner: "acme", repoName: "repo", baseBranch: "main" }],
+        callbackUrl: "https://control.example/image-builds/build-complete",
+        failureCallbackUrl: "https://control.example/image-builds/build-failed",
         callbackToken: "callback-token",
       })
-    ).rejects.toThrow("Failed to trigger OpenComputer repo image build");
+    ).rejects.toThrow("Failed to trigger OpenComputer environment image build");
 
     expect(client.deleteSandbox).toHaveBeenCalledWith("oc-sandbox-1");
     expect(client.deleteSecretStore).toHaveBeenCalledWith("secret-store-1");
